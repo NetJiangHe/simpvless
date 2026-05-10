@@ -8,3 +8,4 @@
 ## 🚀 一键安装命令
 
 ```bash <(curl -Ls https://raw.githubusercontent.com/NetJiangHe/simpvless/main/xray.sh)
+```
