@@ -1,25 +1,47 @@
 #!/bin/sh
 
-# 1. 安装基础依赖
+# 1. 严格的系统环境识别
 if [ -f /etc/alpine-release ]; then
+    OS="alpine"
     apk add --no-cache curl openssl jq ca-certificates
 elif [ -f /etc/debian_version ]; then
+    OS="debian"
     apt-get update && apt-get install -y curl openssl jq
+else
+    echo "Unsupported OS" && exit 1
 fi
 
 # 2. 安装 Xray 核心
+# 使用官方脚本安装二进制文件
 curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh | bash -s -- install
 
-# 3. 生成配置参数
-UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || /usr/local/bin/xray uuid)
+# 3. 【针对 Alpine】手动配置 OpenRC 服务
+if [ "$OS" = "alpine" ]; then
+    cat <<EOF > /etc/init.d/xray
+#!/sbin/openrc-run
+description="Xray Service"
+command="/usr/local/bin/xray"
+command_args="run -c /usr/local/etc/xray/config.json"
+pidfile="/run/xray.pid"
+command_background=true
+depend() {
+    need net
+}
+EOF
+    chmod +x /etc/init.d/xray
+    rc-update add xray default >/dev/null 2>&1
+fi
+
+# 4. 【针对 Alpine 优化】提取密钥
+# 关键修复：使用 tr 过滤掉所有非打印字符和 ANSI 颜色代码
 KEYS=$(/usr/local/bin/xray x25519)
-PRIV_KEY=$(echo "$KEYS" | grep -i "Private" | awk '{print $NF}')
-PUB_KEY=$(echo "$KEYS" | grep -E "Public|Password" | awk '{print $NF}')
+PRIV_KEY=$(echo "$KEYS" | grep -i "Private" | awk '{print $NF}' | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g')
+PUB_KEY=$(echo "$KEYS" | grep -E "Public|Password" | awk '{print $NF}' | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g')
 SHORT_ID=$(openssl rand -hex 4)
 
-# 4. 伪装域名选择
+# 5. 交互式选择伪装域名
 echo "--------------------------------------------------"
-echo "请选择 REALITY 伪装域名 (连接失败请尝试更换):"
+echo "请选择 REALITY 伪装域名:"
 echo "1) Apple (gateway.icloud.com)"
 echo "2) Microsoft (www.microsoft.com)"
 echo "3) Google DL (dl.google.com)"
@@ -39,11 +61,11 @@ case $DOMAIN_CHOICE in
     *) DEST="gateway.icloud.com" ;;
 esac
 
-# 5. 端口设置
+# 6. 端口设置
 read -p "内网监听端口 (默认 443): " LISTEN_PORT
 LISTEN_PORT=${LISTEN_PORT:-443}
 
-# 6. 写入配置
+# 7. 写入配置文件
 mkdir -p /usr/local/etc/xray
 cat <<EOF > /usr/local/etc/xray/config.json
 {
@@ -72,21 +94,20 @@ cat <<EOF > /usr/local/etc/xray/config.json
 }
 EOF
 
-# 7. 重启服务
-if [ -f /etc/alpine-release ]; then
+# 8. 启动服务
+if [ "$OS" = "alpine" ]; then
     rc-service xray restart
 else
     systemctl restart xray
 fi
 
-# 8. 获取公网信息
+# 9. 生成链接
 PUBLIC_IP=$(curl -s https://api.ipify.org || curl -s https://ipv4.icanhazip.com)
 echo "--------------------------------------------------"
 echo "检测到公网 IP: $PUBLIC_IP"
 read -p "请输入公网映射端口 (直接回车默认使用 $LISTEN_PORT): " PUBLIC_PORT
 PUBLIC_PORT=${PUBLIC_PORT:-$LISTEN_PORT}
 
-# 9. 生成 VLESS 链接
 VLESS_LINK="vless://$UUID@$PUBLIC_IP:$PUBLIC_PORT?type=tcp&security=reality&flow=xtls-rprx-vision&sni=$DEST&fp=chrome&pbk=$PUB_KEY&sid=$SHORT_ID#NAT_REALITY"
 
 echo "--------------------------------------------------"
@@ -95,4 +116,3 @@ echo ""
 echo -e "\033[33m$VLESS_LINK\033[0m"
 echo ""
 echo "--------------------------------------------------"
-echo "⚠️  提示：若无法连接，请检查 NAT 映射是否生效，或尝试更换伪装域名。"
