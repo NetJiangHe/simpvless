@@ -1,118 +1,283 @@
-#!/bin/sh
-
-# 1. 严格的系统环境识别
-if [ -f /etc/alpine-release ]; then
-    OS="alpine"
-    apk add --no-cache curl openssl jq ca-certificates
-elif [ -f /etc/debian_version ]; then
-    OS="debian"
-    apt-get update && apt-get install -y curl openssl jq
-else
-    echo "Unsupported OS" && exit 1
-fi
-
-# 2. 安装 Xray 核心
-# 使用官方脚本安装二进制文件
-curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh | bash -s -- install
-
-# 3. 【针对 Alpine】手动配置 OpenRC 服务
-if [ "$OS" = "alpine" ]; then
-    cat <<EOF > /etc/init.d/xray
-#!/sbin/openrc-run
-description="Xray Service"
-command="/usr/local/bin/xray"
-command_args="run -c /usr/local/etc/xray/config.json"
-pidfile="/run/xray.pid"
-command_background=true
-depend() {
-    need net
+#!/bin/bash
+set -e
+#====== 彩色输出函数 (必须放前面) ======
+green() { echo -e "\033[32m$1\033[0m"; }
+red()   { echo -e "\033[31m$1\033[0m"; }
+yellow() { echo -e "\033[33m$1\033[0m"; } 
+#====== 安装依赖 ======
+detect_os() {
+  if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS=$ID
+  else
+    OS=$(uname -s)
+  fi
+  echo "$OS"
 }
-EOF
-    chmod +x /etc/init.d/xray
-    rc-update add xray default >/dev/null 2>&1
-fi
+OS=$(detect_os)
+install_dependencies() {
+  green "检测到系统: $OS，安装依赖..."
+  case "$OS" in
+    ubuntu|debian)
+      sudo apt update
+      sudo apt install -y curl wget xz-utils jq xxd >/dev/null 2>&1
+      ;;
+    centos|rhel|rocky|alma)
+      sudo yum install -y epel-release
+      sudo yum install -y curl wget xz jq vim-common >/dev/null 2>&1
+      ;;
+    alpine)
+      sudo apk update
+      sudo apk add --no-cache curl wget xz jq vim bash openssl
+      ;;
+    *)
+      red "不支持的系统: $OS"
+      exit 1
+      ;;
+  esac
+}
+# 安装前置
+install_dependencies
 
-# 4. 【针对 Alpine 优化】提取密钥
-# 关键修复：使用 tr 过滤掉所有非打印字符和 ANSI 颜色代码
-KEYS=$(/usr/local/bin/xray x25519)
-PRIV_KEY=$(echo "$KEYS" | grep -i "Private" | awk '{print $NF}' | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g')
-PUB_KEY=$(echo "$KEYS" | grep -E "Public|Password" | awk '{print $NF}' | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g')
-SHORT_ID=$(openssl rand -hex 4)
+#====== 检测xray是否安装 =====
+check_and_install_xray() {
+  if command -v xray >/dev/null 2>&1; then
+    green "✅ Xray 已安装，跳过安装"
+  else
+    green "❗检测到 Xray 未安装，正在安装..."
+	if [ "$OS" = "alpine" ]; then
+		bash <(curl -L https://github.com/Lorry-San/fast-vless/raw/refs/heads/main/xrayinstall-alpine.sh)
+	else
+		bash <(curl -L https://github.com/Lorry-San/fast-vless/raw/refs/heads/main/xrayinstall.sh)
+	fi
+    
+    XRAY_BIN=$(command -v xray || echo "/usr/local/bin/xray")
+    if [ ! -x "$XRAY_BIN" ]; then
+      red "❌ Xray 安装失败，请检查"
+      exit 1
+    fi
+    green "✅ Xray 安装完成"
+  fi
+}
+#====== 流媒体解锁检测 ======
+check_streaming_unlock() {
+  bash <(curl -L ip.check.place) -y
+  read -rp "按任意键返回菜单..."
+}
 
-# 5. 交互式选择伪装域名
-echo "--------------------------------------------------"
-echo "请选择 REALITY 伪装域名:"
-echo "1) Apple (gateway.icloud.com)"
-echo "2) Microsoft (www.microsoft.com)"
-echo "3) Google DL (dl.google.com)"
-echo "4) LoL CDN (lol.secure.dyn.riotcdn.net)"
-echo "5) Tesla (www.tesla.com)"
-echo "6) NVIDIA (www.nvidia.com)"
-echo "7) 自定义输入"
-read -p "请输入序号 [1-7, 默认 1]: " DOMAIN_CHOICE
+#====== IP 纯净度检测 ======
+check_ip_clean() {
+  bash <(curl -L ip.check.place) -y
+  read -rp "按任意键返回菜单..."
+}
 
-case $DOMAIN_CHOICE in
-    2) DEST="www.microsoft.com" ;;
-    3) DEST="dl.google.com" ;;
-    4) DEST="lol.secure.dyn.riotcdn.net" ;;
-    5) DEST="www.tesla.com" ;;
-    6) DEST="www.nvidia.com" ;;
-    7) read -p "请输入自定义域名: " DEST ;;
-    *) DEST="gateway.icloud.com" ;;
-esac
+install_trojan_reality() {
+  check_and_install_xray
+  XRAY_BIN=$(command -v xray || echo "/usr/local/bin/xray")
+  read -rp "监听端口（如 443）: " PORT
+  read -rp "节点备注（如：trojanNode）: " REMARK
 
-# 6. 端口设置
-read -p "内网监听端口 (默认 443): " LISTEN_PORT
-LISTEN_PORT=${LISTEN_PORT:-443}
+  PASSWORD=$(openssl rand -hex 8)
+  KEYS=$($XRAY_BIN x25519)
+  PRIV_KEY=$(echo "$KEYS" | awk '/PrivateKey:/ {print $2}')
+  PUB_KEY=$(echo "$KEYS" | awk '/Password/ {print $2}')
+  SHORT_ID=$(head -c 4 /dev/urandom | xxd -p)
+  SNI="icloud.cdn-apple.com"
 
-# 7. 写入配置文件
-mkdir -p /usr/local/etc/xray
-cat <<EOF > /usr/local/etc/xray/config.json
+  mkdir -p /usr/local/etc/xray
+  cat > /usr/local/etc/xray/config.json <<EOF
 {
-    "log": {"loglevel": "warning"},
-    "inbounds": [{
-        "port": $LISTEN_PORT,
-        "protocol": "vless",
-        "settings": {
-            "clients": [{"id": "$UUID", "flow": "xtls-rprx-vision"}],
-            "decryption": "none"
-        },
-        "streamSettings": {
-            "network": "tcp",
-            "security": "reality",
-            "realitySettings": {
-                "show": false,
-                "dest": "$DEST:443",
-                "xver": 0,
-                "serverNames": ["$DEST"],
-                "privateKey": "$PRIV_KEY",
-                "shortIds": ["$SHORT_ID"]
-            }
-        }
-    }],
-    "outbounds": [{"protocol": "freedom"}]
+  "log": { "loglevel": "warning" },
+  "inbounds": [{
+    "port": $PORT,
+    "protocol": "trojan",
+    "settings": {
+      "clients": [{ "password": "$PASSWORD", "email": "$REMARK"}]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "dest": "$SNI:443",
+        "xver": 0,
+        "serverNames": ["$SNI"],
+        "privateKey": "$PRIV_KEY",
+        "shortIds": ["$SHORT_ID"]
+      }
+    }
+  }],
+  "outbounds": [{ "protocol": "freedom" }]
 }
 EOF
 
-# 8. 启动服务
-if [ "$OS" = "alpine" ]; then
-    rc-service xray restart
-else
-    systemctl restart xray
-fi
+  if [ "$OS" = "alpine" ]; then
+      rc-service xray restart
+      rc-update add xray default
+  else
+      systemctl daemon-reexec
+      systemctl restart xray
+      systemctl enable xray
+  fi
+  IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
+  LINK="trojan://$PASSWORD@$IP:$PORT?security=reality&sni=$SNI&pbk=$PUB_KEY&sid=$SHORT_ID&type=tcp&headerType=none#$REMARK"
+  green "✅ Trojan Reality 节点链接如下："
+  echo "$LINK"
+  read -rp "按任意键返回菜单..."
+}
+#====== 主菜单 ======
+while true; do
+  clear
+  green "AD：优秀流媒体便宜LXC小鸡：伤心的云 sadidc.cn"
+  green "AD: 大量优秀解锁 & 优化线路KVM: 光锥云 lightcone.hk"
+  green "======= VLESS Reality 一键脚本V6.1正式版 by Lorry-San（💩山Pro Max） ======="
+  echo "1) 安装并配置 VLESS Reality Vision节点"  
+  echo "2）生成Trojan Reality节点"
+  echo "3) 生成 VLESS 中转链接"
+  echo "4) 开启 BBR 加速"
+  echo "5) 检查 IP 纯净度 & 流媒体解锁"
+  echo "6) Ookla Speedtest 测试"
+  echo "7) 卸载 Xray"
+  echo "0) 退出"
+  echo
+  read -rp "请选择操作: " choice
 
-# 9. 生成链接
-PUBLIC_IP=$(curl -s https://api.ipify.org || curl -s https://ipv4.icanhazip.com)
-echo "--------------------------------------------------"
-echo "检测到公网 IP: $PUBLIC_IP"
-read -p "请输入公网映射端口 (直接回车默认使用 $LISTEN_PORT): " PUBLIC_PORT
-PUBLIC_PORT=${PUBLIC_PORT:-$LISTEN_PORT}
+  case "$choice" in
+	1)
+		check_and_install_xray
+		XRAY_BIN=$(command -v xray || echo "/usr/local/bin/xray")
+		read -rp "监听端口（如 443）: " PORT
+		read -rp "节点备注: " REMARK
+		UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || $XRAY_BIN uuid)
+		KEYS=$($XRAY_BIN x25519)
+		PRIV_KEY=$(echo "$KEYS" | grep -i "Private" | awk '{print $NF}' | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g' | tr -d '[:space:]')
+		PUB_KEY=$(echo "$KEYS" | grep -E "Public|Password" | awk '{print $NF}' | tr -d '\r' | sed 's/\x1b\[[0-9;]*m//g' | tr -d '[:space:]')
+		SHORT_ID=$(openssl rand -hex 4 2>/dev/null || head -c 4 /dev/urandom | xxd -p 2>/dev/null | head -c 8 || echo "77ceb62d")
+		SNI="www.microsoft.com"
 
-VLESS_LINK="vless://$UUID@$PUBLIC_IP:$PUBLIC_PORT?type=tcp&security=reality&flow=xtls-rprx-vision&sni=$DEST&fp=chrome&pbk=$PUB_KEY&sid=$SHORT_ID#NAT_REALITY"
 
-echo "--------------------------------------------------"
-echo -e "\033[32m安装成功！您的 VLESS 链接如下:\033[0m"
-echo ""
-echo -e "\033[33m$VLESS_LINK\033[0m"
-echo ""
-echo "--------------------------------------------------"
+      mkdir -p /usr/local/etc/xray
+      cat > /usr/local/etc/xray/config.json <<EOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [{
+    "port": $PORT,
+    "protocol": "vless",
+    "settings": {
+      "clients": [{ "id": "$UUID", "email": "$REMARK" , "flow": "xtls-rprx-vision"}],
+      "decryption": "none"
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "dest": "$SNI:443",
+        "xver": 0,
+        "serverNames": ["$SNI"],
+        "privateKey": "$PRIV_KEY",
+        "shortIds": ["$SHORT_ID"]
+      }
+    }
+  }],
+  "outbounds": [{ "protocol": "freedom" }]
+}
+EOF
+
+	  if [ "$OS" = "alpine" ]; then
+	      rc-service xray restart
+	      rc-update add xray default
+	  else
+	      systemctl daemon-reexec
+          systemctl restart xray
+          systemctl enable xray
+	  fi
+      IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
+      LINK="vless://$UUID@$IP:$PORT?type=tcp&security=reality&flow=xtls-rprx-vision&sni=$SNI&fp=chrome&pbk=$PUB_KEY&sid=$SHORT_ID#$REMARK"
+      green "✅ 节点链接如下："
+      echo "$LINK"
+      read -rp "按任意键返回菜单..."
+      ;;
+    2)
+      install_trojan_reality
+      ;;
+    3)
+      read -rp "请输入原始 VLESS 链接: " old_link
+      read -rp "请输入中转服务器地址（IP 或域名）: " new_server
+      new_link=$(echo "$old_link" | sed -E "s#(@)[^:]+#\\1$new_server#")
+      green "🎯 生成的新中转链接："
+      echo "$new_link"
+      read -rp "按任意键返回菜单..."
+      ;;
+
+    4)
+	  cat > /etc/sysctl.conf << EOF
+fs.file-max = 6815744
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_ecn=0
+net.ipv4.tcp_frto=0
+net.ipv4.tcp_mtu_probing=0
+net.ipv4.tcp_rfc1337=0
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_fack=1
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_adv_win_scale=1
+net.ipv4.tcp_moderate_rcvbuf=1
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 87380 33554432
+net.ipv4.tcp_wmem=4096 16384 33554432
+net.ipv4.udp_rmem_min=8192
+net.ipv4.udp_wmem_min=8192
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.route_localnet=1
+net.ipv4.conf.all.forwarding=1
+net.ipv4.conf.default.forwarding=1
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.default.forwarding=1
+EOF
+	  sysctl -p && sysctl --system
+      green "✅ BBR 加速已启用"
+      read -rp "按任意键返回菜单..."
+      ;;
+
+    5)
+      check_streaming_unlock
+      ;;
+
+    6)
+      wget -q https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz
+      tar -zxf ookla-speedtest-1.2.0-linux-x86_64.tgz
+      chmod +x speedtest
+      ./speedtest --accept-license --accept-gdpr
+      rm -f speedtest speedtest.5 speedtest.md ookla-speedtest-1.2.0-linux-x86_64.tgz
+      read -rp "按任意键返回菜单..."
+      ;;
+
+    7)
+      if [ "$OS" = "alpine" ]; then
+	   	rc-service xray stop
+        rc-update del xray
+	  else
+	  	systemctl stop xray
+        systemctl disable xray
+	  fi
+      
+      
+      rm -rf /usr/local/etc/xray /usr/local/bin/xray
+      green "✅ Xray 已卸载"
+      read -rp "按任意键返回菜单..."
+      ;;
+
+    0)
+      exit 0
+      ;;
+
+    *)
+      red "❌ 无效选项，请重试"
+      sleep 1
+      ;;
+  esac
+done
